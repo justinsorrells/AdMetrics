@@ -1,8 +1,10 @@
 """Reporting routes."""
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
 
 from admetrics.db.models import Campaign
 from admetrics.db.session import get_db
@@ -26,17 +28,35 @@ def _get_campaign_with_metrics(db: Session, campaign_id: int) -> Campaign:
 
 
 @router.get("/campaigns/{campaign_id}/report", response_model=CampaignReport)
-def get_campaign_report(campaign_id: int, db: Session = Depends(get_db)) -> CampaignReport:
+def get_campaign_report(
+    campaign_id: int,
+    start_date: date | None = Query(None, description="Optional report window start date"),
+    end_date: date | None = Query(None, description="Optional report window end date"),
+    as_of_date: date | None = Query(None, description="Optional date to evaluate campaign pacing"),
+    db: Session = Depends(get_db),
+) -> CampaignReport:
     """Return aggregated reporting metrics for a campaign."""
 
     campaign = _get_campaign_with_metrics(db, campaign_id)
-    return aggregate_campaign(campaign, campaign.metrics)
+    try:
+        return aggregate_campaign(
+            campaign,
+            campaign.metrics,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_date=as_of_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/reports/compare", response_model=CampaignComparison)
 def compare_campaign_reports(
     a: int = Query(..., description="Campaign ID for the first campaign"),
     b: int = Query(..., description="Campaign ID for the second campaign"),
+    start_date: date | None = Query(None, description="Optional report window start date"),
+    end_date: date | None = Query(None, description="Optional report window end date"),
+    as_of_date: date | None = Query(None, description="Optional date to evaluate campaign pacing"),
     db: Session = Depends(get_db),
 ) -> CampaignComparison:
     """Compare two campaigns side by side."""
@@ -49,6 +69,21 @@ def compare_campaign_reports(
 
     campaign_a = _get_campaign_with_metrics(db, a)
     campaign_b = _get_campaign_with_metrics(db, b)
-    report_a = aggregate_campaign(campaign_a, campaign_a.metrics)
-    report_b = aggregate_campaign(campaign_b, campaign_b.metrics)
+    try:
+        report_a = aggregate_campaign(
+            campaign_a,
+            campaign_a.metrics,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_date=as_of_date,
+        )
+        report_b = aggregate_campaign(
+            campaign_b,
+            campaign_b.metrics,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_date=as_of_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return compare_campaigns(report_a, report_b)

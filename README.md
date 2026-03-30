@@ -9,6 +9,9 @@ Ad-tech systems routinely need to accept granular delivery data, compute campaig
 - campaign metadata management
 - daily metric ingestion
 - pandas-based aggregation for CTR and CPA
+- custom date-range reporting windows
+- daily trend output for charting and analytics UIs
+- pacing insight against campaign budget
 - side-by-side campaign comparison for reporting workflows
 
 ## Tech stack
@@ -117,7 +120,7 @@ curl -X POST http://localhost:8000/campaigns/1/metrics \
 ### Campaign report
 
 ```bash
-curl http://localhost:8000/campaigns/1/report
+curl "http://localhost:8000/campaigns/1/report?start_date=2026-03-01&end_date=2026-03-07&as_of_date=2026-03-07"
 ```
 
 Sample response:
@@ -127,6 +130,10 @@ Sample response:
   "campaign_id": 1,
   "campaign_name": "Spring Awareness Push",
   "advertiser": "Acme Media",
+  "report_start_date": "2026-03-01",
+  "report_end_date": "2026-03-07",
+  "days_in_report": 7,
+  "days_with_data": 7,
   "total_impressions": 3000,
   "total_clicks": 260,
   "total_spend": 270.0,
@@ -141,6 +148,32 @@ Sample response:
     "conversions": 22,
     "ctr": 0.08,
     "cpa": 6.82
+  },
+  "daily_breakdown": [
+    {
+      "date": "2026-03-01",
+      "impressions": 1000,
+      "clicks": 100,
+      "spend": 120.0,
+      "conversions": 10,
+      "ctr": 0.1,
+      "cpa": 12.0
+    }
+  ],
+  "pacing": {
+    "as_of_date": "2026-03-07",
+    "campaign_budget": 25000.0,
+    "spend_to_date": 270.0,
+    "remaining_budget": 24730.0,
+    "budget_utilization": 0.0108,
+    "expected_spend_to_date": 5645.16,
+    "pacing_ratio": 0.0478,
+    "average_daily_spend": 38.57,
+    "projected_total_spend": 1195.67,
+    "projected_budget_variance": -23804.33,
+    "elapsed_days": 7,
+    "total_campaign_days": 31,
+    "pacing_status": "underpacing"
   }
 }
 ```
@@ -148,7 +181,7 @@ Sample response:
 ### Compare campaigns
 
 ```bash
-curl "http://localhost:8000/reports/compare?a=1&b=2"
+curl "http://localhost:8000/reports/compare?a=1&b=2&start_date=2026-03-01&end_date=2026-03-07&as_of_date=2026-03-07"
 ```
 
 Sample response:
@@ -159,6 +192,10 @@ Sample response:
     "campaign_id": 1,
     "campaign_name": "Campaign A",
     "advertiser": "Adventure Co",
+    "report_start_date": "2026-03-01",
+    "report_end_date": "2026-03-07",
+    "days_in_report": 7,
+    "days_with_data": 7,
     "total_impressions": 1000,
     "total_clicks": 60,
     "total_spend": 120.0,
@@ -173,12 +210,42 @@ Sample response:
       "conversions": 6,
       "ctr": 0.06,
       "cpa": 20.0
+    },
+    "daily_breakdown": [
+      {
+        "date": "2026-03-01",
+        "impressions": 1000,
+        "clicks": 60,
+        "spend": 120.0,
+        "conversions": 6,
+        "ctr": 0.06,
+        "cpa": 20.0
+      }
+    ],
+    "pacing": {
+      "as_of_date": "2026-03-07",
+      "campaign_budget": 15000.0,
+      "spend_to_date": 120.0,
+      "remaining_budget": 14880.0,
+      "budget_utilization": 0.008,
+      "expected_spend_to_date": 3387.1,
+      "pacing_ratio": 0.0354,
+      "average_daily_spend": 17.14,
+      "projected_total_spend": 531.34,
+      "projected_budget_variance": -14468.66,
+      "elapsed_days": 7,
+      "total_campaign_days": 31,
+      "pacing_status": "underpacing"
     }
   },
   "campaign_b": {
     "campaign_id": 2,
     "campaign_name": "Campaign B",
     "advertiser": "Adventure Co",
+    "report_start_date": "2026-03-01",
+    "report_end_date": "2026-03-07",
+    "days_in_report": 7,
+    "days_with_data": 7,
     "total_impressions": 1200,
     "total_clicks": 84,
     "total_spend": 100.0,
@@ -193,6 +260,32 @@ Sample response:
       "conversions": 9,
       "ctr": 0.07,
       "cpa": 11.11
+    },
+    "daily_breakdown": [
+      {
+        "date": "2026-03-01",
+        "impressions": 1200,
+        "clicks": 84,
+        "spend": 100.0,
+        "conversions": 9,
+        "ctr": 0.07,
+        "cpa": 11.11
+      }
+    ],
+    "pacing": {
+      "as_of_date": "2026-03-07",
+      "campaign_budget": 15000.0,
+      "spend_to_date": 100.0,
+      "remaining_budget": 14900.0,
+      "budget_utilization": 0.0067,
+      "expected_spend_to_date": 3387.1,
+      "pacing_ratio": 0.0295,
+      "average_daily_spend": 14.29,
+      "projected_total_spend": 442.99,
+      "projected_budget_variance": -14557.01,
+      "elapsed_days": 7,
+      "total_campaign_days": 31,
+      "pacing_status": "underpacing"
     }
   },
   "comparisons": [
@@ -234,4 +327,7 @@ pytest --cov=admetrics --cov-report=term-missing
 
 - CTR is calculated as `clicks / impressions` and returns `0.0` when impressions are zero.
 - CPA is calculated as `spend / conversions` and returns `null` when conversions are zero.
+- Report endpoints accept optional `start_date`, `end_date`, and `as_of_date` query parameters.
+- Daily breakdowns are zero-filled inside the requested report window so frontends can plot stable trend lines.
+- Pacing status is marked as `underpacing`, `on_track`, or `overpacing` with a 5% tolerance, and as `complete` once the campaign end date is reached.
 - The best performing day is chosen by highest conversions, then highest CTR, then lowest spend.

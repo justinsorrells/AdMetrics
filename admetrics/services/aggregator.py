@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import date
 
 import pandas as pd
 
 from admetrics.db.models import Campaign, DailyMetric
-from admetrics.schemas.report import BestPerformingDay, CampaignComparison, CampaignReport, ComparisonMetric
+from admetrics.schemas.report import (
+    BestPerformingDay,
+    CampaignComparison,
+    CampaignReport,
+    ComparisonMetric,
+    DailyTrendPoint,
+    PacingInsight,
+)
 
 
 def _round_currency(value: float | None) -> float | None:
@@ -40,22 +48,11 @@ def _safe_cpa(spend: float, conversions: float) -> float | None:
     return spend / conversions
 
 
-def aggregate_campaign(campaign: Campaign, metrics: Sequence[DailyMetric]) -> CampaignReport:
-    """Aggregate campaign metrics into a report model."""
+def _build_metric_frame(metrics: Sequence[DailyMetric]) -> pd.DataFrame:
+    """Convert campaign metric rows into a pandas DataFrame."""
 
     if not metrics:
-        return CampaignReport(
-            campaign_id=campaign.id,
-            campaign_name=campaign.name,
-            advertiser=campaign.advertiser,
-            total_impressions=0,
-            total_clicks=0,
-            total_spend=0.0,
-            total_conversions=0,
-            ctr=0.0,
-            cpa=None,
-            best_performing_day=None,
-        )
+        return pd.DataFrame(columns=["date", "impressions", "clicks", "spend", "conversions"])
 
     frame = pd.DataFrame(
         [
@@ -69,20 +66,211 @@ def aggregate_campaign(campaign: Campaign, metrics: Sequence[DailyMetric]) -> Ca
             for metric in metrics
         ]
     )
-    frame["ctr"] = frame.apply(lambda row: _safe_rate(row["clicks"], row["impressions"]), axis=1)
-    frame["cpa"] = frame.apply(lambda row: _safe_cpa(row["spend"], row["conversions"]), axis=1)
-    best_row = frame.sort_values(
+    frame["date"] = pd.to_datetime(frame["date"])
+    return frame
+
+
+def _resolve_report_window(
+    campaign: Campaign,
+    start_date: date | None,
+    end_date: date | None,
+) -> tuple[date, date]:
+    """Return the effective report window for a campaign."""
+
+    requested_start = start_date or campaign.start_date
+    requested_end = end_date or campaign.end_date
+
+    if requested_end < requested_start:
+        raise ValueError("start_date must be on or before end_date")
+
+    effective_start = max(requested_start, campaign.start_date)
+    effective_end = min(requested_end, campaign.end_date)
+
+    if effective_end < effective_start:
+        raise ValueError("Requested report window does not overlap the campaign date range")
+
+    return effective_start, effective_end
+
+
+def _serialize_daily_breakdown(frame: pd.DataFrame) -> list[DailyTrendPoint]:
+    """Convert a trend DataFrame into response models."""
+
+    breakdown: list[DailyTrendPoint] = []
+    for row in frame.to_dict("records"):
+        day = row["date"].date() if hasattr(row["date"], "date") else row["date"]
+        breakdown.append(
+            DailyTrendPoint(
+                date=day,
+                impressions=int(row["impressions"]),
+                clicks=int(row["clicks"]),
+                spend=_round_currency(row["spend"]) or 0.0,
+                conversions=int(row["conversions"]),
+                ctr=_round_rate(row["ctr"]),
+                cpa=_round_currency(row["cpa"]),
+            )
+        )
+    return breakdown
+
+
+def _build_trend_frame(
+    filtered_frame: pd.DataFrame,
+    report_start_date: date,
+    report_end_date: date,
+) -> pd.DataFrame:
+    """Create a zero-filled daily trend frame for the report window."""
+
+    date_index = pd.date_range(start=report_start_date, end=report_end_date, freq="D")
+    trend_frame = pd.DataFrame({"date": date_index})
+
+    if filtered_frame.empty:
+        trend_frame["impressions"] = 0
+        trend_frame["clicks"] = 0
+        trend_frame["spend"] = 0.0
+        trend_frame["conversions"] = 0
+    else:
+        trend_frame = trend_frame.merge(
+            filtered_frame[["date", "impressions", "clicks", "spend", "conversions"]],
+            on="date",
+            how="left",
+        )
+        trend_frame["impressions"] = trend_frame["impressions"].fillna(0).astype(int)
+        trend_frame["clicks"] = trend_frame["clicks"].fillna(0).astype(int)
+        trend_frame["spend"] = trend_frame["spend"].fillna(0.0).astype(float)
+        trend_frame["conversions"] = trend_frame["conversions"].fillna(0).astype(int)
+
+    trend_frame["ctr"] = trend_frame.apply(lambda row: _safe_rate(row["clicks"], row["impressions"]), axis=1)
+    trend_frame["cpa"] = trend_frame.apply(lambda row: _safe_cpa(row["spend"], row["conversions"]), axis=1)
+    return trend_frame
+
+
+def _build_pacing_insight(
+    campaign: Campaign,
+    all_metrics_frame: pd.DataFrame,
+    as_of_date: date | None,
+) -> PacingInsight:
+    """Calculate campaign pacing against budget and elapsed days."""
+
+    requested_as_of = as_of_date or date.today()
+    total_campaign_days = (campaign.end_date - campaign.start_date).days + 1
+
+    if requested_as_of < campaign.start_date:
+        spend_to_date = 0.0
+        elapsed_days = 0
+        expected_spend_to_date = 0.0
+        average_daily_spend = 0.0
+        projected_total_spend = 0.0
+        pacing_ratio = None
+        pacing_status = "not_started"
+        effective_as_of = requested_as_of
+    else:
+        effective_as_of = min(requested_as_of, campaign.end_date)
+        elapsed_days = (effective_as_of - campaign.start_date).days + 1
+
+        if all_metrics_frame.empty:
+            spend_to_date = 0.0
+        else:
+            spend_to_date = float(
+                all_metrics_frame.loc[
+                    all_metrics_frame["date"] <= pd.Timestamp(effective_as_of),
+                    "spend",
+                ].sum()
+            )
+
+        expected_spend_to_date = campaign.budget * (elapsed_days / total_campaign_days)
+        average_daily_spend = spend_to_date / elapsed_days if elapsed_days else 0.0
+        projected_total_spend = average_daily_spend * total_campaign_days if elapsed_days else 0.0
+        pacing_ratio = (
+            _round_rate(_safe_rate(spend_to_date, expected_spend_to_date))
+            if expected_spend_to_date > 0
+            else None
+        )
+
+        if requested_as_of >= campaign.end_date:
+            pacing_status = "complete"
+        elif pacing_ratio is not None and pacing_ratio < 0.95:
+            pacing_status = "underpacing"
+        elif pacing_ratio is not None and pacing_ratio > 1.05:
+            pacing_status = "overpacing"
+        else:
+            pacing_status = "on_track"
+
+    remaining_budget = campaign.budget - spend_to_date
+    projected_budget_variance = projected_total_spend - campaign.budget
+
+    return PacingInsight(
+        as_of_date=effective_as_of,
+        campaign_budget=_round_currency(campaign.budget) or 0.0,
+        spend_to_date=_round_currency(spend_to_date) or 0.0,
+        remaining_budget=_round_currency(remaining_budget) or 0.0,
+        budget_utilization=_round_rate(_safe_rate(spend_to_date, campaign.budget)),
+        expected_spend_to_date=_round_currency(expected_spend_to_date) or 0.0,
+        pacing_ratio=pacing_ratio,
+        average_daily_spend=_round_currency(average_daily_spend) or 0.0,
+        projected_total_spend=_round_currency(projected_total_spend) or 0.0,
+        projected_budget_variance=_round_currency(projected_budget_variance) or 0.0,
+        elapsed_days=elapsed_days,
+        total_campaign_days=total_campaign_days,
+        pacing_status=pacing_status,
+    )
+
+
+def aggregate_campaign(
+    campaign: Campaign,
+    metrics: Sequence[DailyMetric],
+    start_date: date | None = None,
+    end_date: date | None = None,
+    as_of_date: date | None = None,
+) -> CampaignReport:
+    """Aggregate campaign metrics into a report model."""
+
+    report_start_date, report_end_date = _resolve_report_window(campaign, start_date, end_date)
+    all_metrics_frame = _build_metric_frame(metrics)
+
+    if all_metrics_frame.empty:
+        filtered_frame = all_metrics_frame.copy()
+    else:
+        filtered_frame = all_metrics_frame.loc[
+            (all_metrics_frame["date"] >= pd.Timestamp(report_start_date))
+            & (all_metrics_frame["date"] <= pd.Timestamp(report_end_date))
+        ].copy()
+
+    trend_frame = _build_trend_frame(filtered_frame, report_start_date, report_end_date)
+    pacing = _build_pacing_insight(campaign, all_metrics_frame, as_of_date)
+
+    if filtered_frame.empty:
+        return CampaignReport(
+            campaign_id=campaign.id,
+            campaign_name=campaign.name,
+            advertiser=campaign.advertiser,
+            report_start_date=report_start_date,
+            report_end_date=report_end_date,
+            days_in_report=(report_end_date - report_start_date).days + 1,
+            days_with_data=0,
+            total_impressions=0,
+            total_clicks=0,
+            total_spend=0.0,
+            total_conversions=0,
+            ctr=0.0,
+            cpa=None,
+            best_performing_day=None,
+            daily_breakdown=_serialize_daily_breakdown(trend_frame),
+            pacing=pacing,
+        )
+
+    filtered_frame["ctr"] = filtered_frame.apply(lambda row: _safe_rate(row["clicks"], row["impressions"]), axis=1)
+    filtered_frame["cpa"] = filtered_frame.apply(lambda row: _safe_cpa(row["spend"], row["conversions"]), axis=1)
+    best_row = filtered_frame.sort_values(
         by=["conversions", "ctr", "spend", "date"],
         ascending=[False, False, True, True],
     ).iloc[0]
 
-    total_impressions = int(frame["impressions"].sum())
-    total_clicks = int(frame["clicks"].sum())
-    total_spend = float(frame["spend"].sum())
-    total_conversions = int(frame["conversions"].sum())
+    total_impressions = int(filtered_frame["impressions"].sum())
+    total_clicks = int(filtered_frame["clicks"].sum())
+    total_spend = float(filtered_frame["spend"].sum())
+    total_conversions = int(filtered_frame["conversions"].sum())
 
     best_performing_day = BestPerformingDay(
-        date=best_row["date"],
+        date=best_row["date"].date(),
         impressions=int(best_row["impressions"]),
         clicks=int(best_row["clicks"]),
         spend=_round_currency(best_row["spend"]) or 0.0,
@@ -95,6 +283,10 @@ def aggregate_campaign(campaign: Campaign, metrics: Sequence[DailyMetric]) -> Ca
         campaign_id=campaign.id,
         campaign_name=campaign.name,
         advertiser=campaign.advertiser,
+        report_start_date=report_start_date,
+        report_end_date=report_end_date,
+        days_in_report=(report_end_date - report_start_date).days + 1,
+        days_with_data=len(filtered_frame.index),
         total_impressions=total_impressions,
         total_clicks=total_clicks,
         total_spend=_round_currency(total_spend) or 0.0,
@@ -102,6 +294,8 @@ def aggregate_campaign(campaign: Campaign, metrics: Sequence[DailyMetric]) -> Ca
         ctr=_round_rate(_safe_rate(total_clicks, total_impressions)),
         cpa=_round_currency(_safe_cpa(total_spend, total_conversions)),
         best_performing_day=best_performing_day,
+        daily_breakdown=_serialize_daily_breakdown(trend_frame),
+        pacing=pacing,
     )
 
 
